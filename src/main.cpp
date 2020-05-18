@@ -55,9 +55,27 @@ const char* mdnsName = ESP_NAME; // Domain name for the mDNS responder
 const char *ssid = ESP_NAME; // The name of the Wi-Fi network that will be created
 const char *password = WIFI_PASS;   // The password required to connect to it, leave blank for an open network
 
-
 const char *OTAName = ESP_NAME;           // A name and a password for the OTA service
 const char *OTAPassword = WIFI_PASS;
+
+
+
+/*  For MQTT Publish   */
+#define ENABLE_MQTT true
+#ifdef ENABLE_MQTT
+  bool MQTT_ENABLED=true;
+  #include "MQTTCred.h"
+  WiFiClient client;
+  #include "Adafruit_MQTT.h"
+  #include "Adafruit_MQTT_Client.h"
+  #define MQTT_FEED "devices/GPSDO_ESP8266/UART/RX"
+  Adafruit_MQTT_Client mqtt(&client,MQTT_SERVER,MQTT_PORT,MQTT_USER,MQTT_PASS);
+  Adafruit_MQTT_Publish feed = Adafruit_MQTT_Publish(&mqtt, MQTT_FEED);
+
+  uint lastMQTTKeepAlive=0;
+#else
+  bool MQTT_ENABLED=false;
+#endif
 
 #define DISCONNECTED  -1
 #define LED_PIN   LED_BUILTIN
@@ -129,18 +147,22 @@ bool handleFileRead(String path) { // send the right file to the client (if it e
   #ifdef DEBUG
     Serial.println("handleFileRead: " + path);
   #endif
+
   if (path.endsWith("/")) path += "index.html";          // If a folder is requested, send the index file
   String contentType = getContentType(path);             // Get the MIME type
   String pathWithGz = path + ".gz";
+
   if (SPIFFS.exists(pathWithGz) || SPIFFS.exists(path)) { // If the file exists, either as a compressed archive, or normal
     if (SPIFFS.exists(pathWithGz))                         // If there's a compressed version available
       path += ".gz";                                         // Use the compressed verion
     File file = SPIFFS.open(path, "r");                    // Open the file
     size_t sent = server.streamFile(file, contentType);    // Send it to the client
     file.close();                                          // Close the file again
+
     #ifdef DEBUG
       Serial.println(String("\tSent file: ") + path);
     #endif
+
     return true;
   }
   #ifdef DEBUG
@@ -244,6 +266,7 @@ void startWiFi() { // Start a Wi-Fi access point, and try to connect to some giv
   #ifdef DEBUG
     Serial.println("\r\n");
   #endif
+
   if(WiFi.softAPgetStationNum() == 0) {      // If the ESP is connected to an AP
     #ifdef DEBUG
       Serial.print("Connected to ");
@@ -409,6 +432,71 @@ String readDataFromUART(){
   return out;
 }
 
+#ifdef ENABLE_MQTT
+  // Function to connect and reconnect as necessary to the MQTT server.
+  // Should be called in the loop function and it will take care if connecting.
+  bool MQTT_connect() {
+    if(!MQTT_ENABLED) return false;
+
+    int8_t ret;
+
+    // Stop if already connected.
+    if (mqtt.connected()) return true;
+
+    #ifdef DEBUG
+      Serial.print(F("Connecting to MQTT... "));
+    #endif
+
+    uint8_t retries = 3;
+    while ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
+      #ifdef DEBUG
+        Serial.println(mqtt.connectErrorString(ret));
+        Serial.println(F("Retrying MQTT connection in 5 seconds..."));
+      #endif
+
+      mqtt.disconnect();
+      delay(1000);  // wait 1 seconds
+      retries--;
+
+      if (retries == 0) return false;
+    }
+
+    #ifdef DEBUG
+      Serial.println(F("MQTT Connected!"));
+    #endif
+
+    return true;
+  }
+
+  bool MQTT_send(String data){
+    if(!MQTT_ENABLED) return false;
+
+    // KeepAlive each 3 seconds
+    if(lastMQTTKeepAlive<millis()-3000){
+      lastMQTTKeepAlive=millis();
+      if(!mqtt.ping()) mqtt.disconnect();  // Keep Alive
+    }
+
+    if(data.isEmpty()) return false;
+
+    if(!MQTT_connect()) return false;
+
+    if (!feed.publish(data.c_str())){
+      #ifdef DEBUG
+        Serial.println(F("Publish Failed."));
+      #endif
+
+      return false;
+    }
+
+    #ifdef DEBUG
+      Serial.println(F("Publish Success!"));
+    #endif
+
+    return true;
+  }
+#endif
+
 /*__________________________________________________________SETUP__________________________________________________________*/
 void setup() {
   delay(10);
@@ -446,6 +534,9 @@ void setup() {
 
   setClock();
 
+  #ifdef ENABLE_MQTT
+    MQTT_connect();
+  #endif
 }
 
 /*__________________________________________________________LOOP__________________________________________________________*/
@@ -455,6 +546,11 @@ void loop() {
   ArduinoOTA.handle();                        // listen for OTA events
   
   String intputString=readDataFromUART();
+
+  #ifdef ENABLE_MQTT
+    MQTT_send(intputString);
+  #endif
+
   sendDataToWebSocketsClients(intputString);
 
   optimistic_yield(1000);
